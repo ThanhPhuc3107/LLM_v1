@@ -1,0 +1,35 @@
+{
+  "name": "aps-simple-viewer-nodejs",
+  "version": "1.0.0",
+  "description": "Autodesk Platform Services application built by following the Simple Viewer tutorial from https://aps.autodesk.com/tutorials.",
+  "scripts": {
+    "start": "node server.js",
+    "setup:db": "node scripts/setup-database.js",
+    "preprocess": "node scripts/preprocess-data.js",
+    "migrate": "node scripts/migrate-to-sqlite.js",
+    "analyze": "node scripts/analyze-data.js",
+    "test:category": "node scripts/test-category-detection.js"
+  },
+  "keywords": [
+    "autodesk-platform-services"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@aps_sdk/authentication": "^1.0.0",
+    "@aps_sdk/model-derivative": "^1.0.0",
+    "@aps_sdk/oss": "^1.0.1",
+    "@google/generative-ai": "^0.21.0",
+    "axios": "^1.13.2",
+    "better-sqlite3": "^12.6.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "express-formidable": "^1.2.0",
+    "openai": "^6.16.0"
+  },
+  "devDependencies": {
+    "@types/forge-viewer": "^7.99.1"
+  },
+  "main": "config.js",
+  "author": "",
+  "type": "commonjs"
+}

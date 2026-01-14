@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <link rel="icon" type="image/x-icon" href="https://cdn.autodesk.io/favicon.ico">
+    <link rel="stylesheet" href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.css">
+    <link rel="stylesheet" href="/main.css">
+    <title>Autodesk Platform Services: Simple Viewer</title>
+</head>
+
+<body>
+    <div id="header">
+        <img class="logo" src="https://cdn.autodesk.io/logo/black/stacked.png" alt="Autodesk Platform Services">
+        <span class="title">Simple Viewer</span>
+        <select name="models" id="models"></select>
+        <button id="upload" title="Upload New Model">Upload</button>
+        <button id="chat-toggle" title="Ask questions about the model">💬 Chat</button>
+        <input style="display: none" type="file" id="input">
+    </div>
+    <div id="preview"></div>
+    <div id="overlay"></div>
+
+    <!-- Chat Modal -->
+    <div id="chat-modal" class="chat-modal">
+        <div class="chat-container">
+            <div class="chat-header">
+                <h3>🏗️ BIM Assistant</h3>
+                <button id="chat-close" class="chat-close">&times;</button>
+            </div>
+            <div class="chat-messages" id="chat-messages">
+                <div class="chat-message bot">
+                    <div class="message-content">
+                        Xin chào! Tôi có thể giúp bạn tìm hiểu về mô hình BIM này. Hãy hỏi tôi về:
+                        <ul>
+                            <li>Số lượng các thành phần (cửa, cửa sổ, tường...)</li>
+                            <li>Các loại thiết bị và vật liệu</li>
+                            <li>Thông tin theo tầng hoặc phòng</li>
+                            <li>Diện tích và kích thước</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-input-container">
+                <input
+                    type="text"
+                    id="chat-input"
+                    class="chat-input"
+                    placeholder="Nhập câu hỏi của bạn... (ví dụ: Có bao nhiêu cửa?)"
+                >
+                <button id="chat-send" class="chat-send">Gửi</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.js"></script>
+    <script src="/main.js" type="module"></script>
+</body>
+
+</html>
