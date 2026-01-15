@@ -1,10 +1,50 @@
-// routes/chat.js
+// ============================================
+// SECTION 1: IMPORTS & DEPENDENCIES
+// ============================================
+
 const express = require("express");
 const router = express.Router();
 
 const { getDb, semanticSearch } = require("../services/sqlite");
 const { geminiJson, geminiText } = require("../services/gemini");
 const { generateEmbedding } = require("../services/embeddings");
+
+// ============================================
+// SECTION 2: CONSTANTS
+// ============================================
+
+const ALLOWED_PARAMS = new Set([
+    "level_number",
+    "room_name",
+    "room_type",
+    "system_name",
+    "system_type",
+    "manufacturer",
+    "model_name",
+    "type_name",
+    "family_name",
+    "omniclass_title",
+]);
+
+const SAMPLE_KEYS = [
+    "level_number",
+    "room_name",
+    "room_type",
+    "system_name",
+    "system_type",
+    "manufacturer",
+    "model_name",
+    "omniclass_title",
+    "type_name",
+    "family_name",
+];
+
+const DEFAULT_LIMIT = 20;
+const DEFAULT_TOP_K = 100;
+
+// ============================================
+// SECTION 3: STRING UTILITIES
+// ============================================
 
 function norm(s) {
     return String(s || "").trim();
@@ -14,17 +54,294 @@ function stripEmpty(arr) {
     return (arr || []).map(norm).filter(Boolean);
 }
 
-// LLM-based category detection (replaced keyword matching)
+// ============================================
+// SECTION 4: DATABASE HELPERS
+// ============================================
+
+async function getMeta(db, urn) {
+    const compRows = db
+        .prepare(
+            "SELECT DISTINCT component_type FROM elements WHERE urn = ? AND component_type IS NOT NULL AND component_type != ''"
+        )
+        .all(urn);
+    const categories = stripEmpty(compRows.map((r) => r.component_type));
+    const categoryField = "component_type";
+
+    const paramSamples = {};
+    for (const k of SAMPLE_KEYS) {
+        const rows = db
+            .prepare(
+                `SELECT DISTINCT ${k} FROM elements WHERE urn = ? AND ${k} IS NOT NULL AND ${k} != '' LIMIT 15`
+            )
+            .all(urn);
+        paramSamples[k] = stripEmpty(rows.map((r) => r[k]));
+    }
+
+    const docs = db
+        .prepare("SELECT props_flat FROM elements WHERE urn = ? LIMIT 50")
+        .all(urn);
+    const areaKeySet = new Set();
+    for (const d of docs) {
+        if (!d.props_flat) continue;
+        const pf = JSON.parse(d.props_flat);
+        for (const k of Object.keys(pf)) {
+            if (/area/i.test(k)) areaKeySet.add(k);
+        }
+    }
+
+    return {
+        categoryField,
+        categories,
+        paramSamples,
+        areaKeys: Array.from(areaKeySet).slice(0, 200),
+    };
+}
+
+// ============================================
+// SECTION 5: QUERY TASK HANDLERS
+// ============================================
+
+function handleCountTask(db, whereClause, params) {
+    console.log(
+        "🔍 Count query:",
+        `SELECT COUNT(*) as count FROM elements WHERE ${whereClause}`
+    );
+    const row = db
+        .prepare(`SELECT COUNT(*) as count FROM elements WHERE ${whereClause}`)
+        .get(...params);
+    return { kind: "count", count: row.count };
+}
+
+function handleDistinctTask(db, whereClause, params, field, limit) {
+    if (!field) throw new Error("distinct requires targetParam");
+
+    const rows = db
+        .prepare(
+            `SELECT DISTINCT ${field} FROM elements WHERE ${whereClause} AND ${field} IS NOT NULL LIMIT ?`
+        )
+        .all(...params, limit);
+
+    const values = rows.map((r) => norm(r[field])).filter(Boolean);
+    return { kind: "distinct", field, values };
+}
+
+function handleGroupCountTask(db, whereClause, params, field, limit) {
+    if (!field) throw new Error("group_count requires targetParam");
+
+    const rows = db
+        .prepare(
+            `SELECT ${field}, COUNT(*) as count
+             FROM elements
+             WHERE ${whereClause} AND ${field} IS NOT NULL
+             GROUP BY ${field}
+             ORDER BY count DESC
+             LIMIT ?`
+        )
+        .all(...params, limit);
+
+    return { kind: "group_count", field, rows };
+}
+
+async function handleSumAreaTask(db, whereClause, params, plan, question) {
+    const propsFlatKey = plan.propsFlatKey;
+    if (!propsFlatKey) throw new Error("sum_area requires propsFlatKey");
+
+    const rows = db
+        .prepare(
+            `SELECT json_extract(props_flat, ?) as area_raw, name, type_name, level_number FROM elements WHERE ${whereClause}`
+        )
+        .all(`$."${propsFlatKey}"`, ...params);
+    console.log("📝 Rows:", rows);
+
+    const areaAnalysisPrompt = `You are a BIM data analyst. Extract and calculate the total area from the provided data based on the user's question and query context.
+
+User question: ${question || plan?.notes}
+
+Query context (what data should be included):
+- Category filter: ${plan.category || "All components"}
+- Property key being analyzed: ${propsFlatKey}
+- Additional filter: ${
+        plan.filterParam ? `${plan.filterParam} = ${plan.filterValue}` : "None"
+    }
+
+Available data rows (already pre-filtered by SQL, showing area_raw, name, type_name, level_number):
+${JSON.stringify(rows.slice(0, 100), null, 2)}
+
+Instructions:
+1. Review the user's question
+2. The rows provided are ALREADY filtered by SQL based on the user's question
+3. Parse EACH area_raw value from the provided rows:
+   - Handle numbers: 123.45
+   - Handle strings with units: "123.45 m²", "123.45m2"
+   - Handle comma decimals: "123,45"
+   - Extract only the numeric part and convert to float
+4. Pick suitable area_raw value from the provided rows based on the user's question
+5. Calcuate and return JSON with:
+   {
+     "total_area": number (sum of all valid areas),
+     "count": number (count of rows with valid area values),
+     "unit": "m²" or detected unit from the data,
+     "notes": "brief explanation in Vietnamese - what was calculated, which components/floors/filters were included"
+   }
+
+CRITICAL:
+- Include ALL rows provided (they are already filtered by the SQL query)
+- In notes, explain what was calculated (e.g., "Tổng diện tích căn nhà" or "Diện tích sàn tầng 2")`;
+
+    const areaResult = await geminiJson(areaAnalysisPrompt, {
+        temperature: 0.1,
+    });
+    console.log("🧮 Gemini area analysis:", areaResult);
+
+    return {
+        kind: "sum_area",
+        propsFlatKey,
+        total_area: areaResult.total_area || 0,
+        n: areaResult.count || 0,
+        unit: areaResult.unit || "m²",
+        notes: areaResult.notes || "",
+    };
+}
+
+function handleListTask(db, whereClause, params, limit) {
+    const rows = db
+        .prepare(
+            `SELECT urn, guid, dbId, name, component_type, type_name, family_name,
+                    level_number, room_name, room_type,
+                    system_type, system_name,
+                    manufacturer, model_name,
+                    omniclass_title, omniclass_number
+             FROM elements
+             WHERE ${whereClause}
+             LIMIT ?`
+        )
+        .all(...params, limit);
+
+    const docs = rows.map((r) => ({
+        urn: r.urn,
+        guid: r.guid,
+        dbId: r.dbId,
+        name: r.name,
+        basic: {
+            component_type: r.component_type,
+            type_name: r.type_name,
+            family_name: r.family_name,
+        },
+        location: {
+            level_number: r.level_number,
+            room_name: r.room_name,
+            room_type: r.room_type,
+        },
+        system: {
+            system_type: r.system_type,
+            system_name: r.system_name,
+        },
+        equipment: {
+            manufacturer: r.manufacturer,
+            model_name: r.model_name,
+        },
+        omniclass: {
+            title: r.omniclass_title,
+            number: r.omniclass_number,
+        },
+    }));
+
+    return { kind: "list", docs };
+}
+
+// ============================================
+// SECTION 6: QUERY ORCHESTRATION
+// ============================================
+
+async function runQuery(db, meta, plan, question) {
+    const { urn } = plan;
+    const category = plan.category ? norm(plan.category) : null;
+    const limit = Number.isFinite(plan.limit) ? plan.limit : DEFAULT_LIMIT;
+
+    // Semantic search for candidate IDs
+    let candidateIds = null;
+    if (plan.useSemanticSearch && plan.semanticQuery) {
+        try {
+            const queryEmbed = await generateEmbedding(plan.semanticQuery);
+            if (queryEmbed) {
+                candidateIds = semanticSearch(
+                    db,
+                    urn,
+                    queryEmbed,
+                    plan.topK || DEFAULT_TOP_K
+                );
+                console.log(
+                    `🔍 Semantic search found ${candidateIds.length} candidates`
+                );
+            }
+        } catch (error) {
+            console.error("⚠ Semantic search failed:", error.message);
+        }
+    }
+
+    // Build WHERE clause
+    const whereClauses = ["urn = ?"];
+    const params = [urn];
+
+    if (candidateIds && candidateIds.length > 0) {
+        whereClauses.push(`id IN (${candidateIds.join(",")})`);
+    }
+
+    if (category) {
+        whereClauses.push(`${meta.categoryField} = ?`);
+        params.push(category);
+    }
+
+    if (
+        plan.filterParam &&
+        plan.filterValue !== undefined &&
+        plan.filterValue !== null &&
+        String(plan.filterValue).trim() !== ""
+    ) {
+        whereClauses.push(`${plan.filterParam} = ?`);
+        params.push(plan.filterValue);
+    }
+
+    const whereClause = whereClauses.join(" AND ");
+
+    // Dispatch to task handler
+    switch (plan.task) {
+        case "count":
+            return handleCountTask(db, whereClause, params);
+        case "distinct":
+            return handleDistinctTask(
+                db,
+                whereClause,
+                params,
+                plan.targetParam,
+                limit
+            );
+        case "group_count":
+            return handleGroupCountTask(
+                db,
+                whereClause,
+                params,
+                plan.targetParam,
+                limit
+            );
+        case "sum_area":
+            return handleSumAreaTask(db, whereClause, params, plan, question);
+        default:
+            return handleListTask(db, whereClause, params, limit);
+    }
+}
+
+// ============================================
+// SECTION 7: LLM INTEGRATION
+// ============================================
+
 async function detectHintCategory(question, availableCategories) {
     if (!question || !availableCategories || availableCategories.length === 0) {
         return null;
     }
 
     console.log("💡 Available categories:", availableCategories);
-    // Quick keyword fallback for common cases (for speed)
-    const q = question.toLowerCase();
 
-    // Use LLM for intelligent mapping
     try {
         const prompt = `Bạn là chuyên gia BIM. Dựa vào câu hỏi của người dùng, hãy xác định loại thành phần BIM (component_type) phù hợp nhất.
 
@@ -68,272 +385,9 @@ Lưu ý:
     return null;
 }
 
-// ----- SQLite helpers -----
-
-async function getMeta(db, urn) {
-    // Get distinct component types (primary category field after preprocessing)
-    const compRows = db
-        .prepare(
-            "SELECT DISTINCT component_type FROM elements WHERE urn = ? AND component_type IS NOT NULL AND component_type != ''"
-        )
-        .all(urn);
-    const categories = stripEmpty(compRows.map((r) => r.component_type));
-
-    // Always use component_type as category field (normalized in preprocessing)
-    const categoryField = "component_type";
-
-    // param samples (small) for planner
-    const sampleKeys = [
-        "level_number",
-        "room_name",
-        "room_type",
-        "system_name",
-        "system_type",
-        "manufacturer",
-        "model_name",
-        "omniclass_title",
-        "type_name",
-        "family_name",
-    ];
-
-    const paramSamples = {};
-    for (const k of sampleKeys) {
-        const rows = db
-            .prepare(
-                `SELECT DISTINCT ${k} FROM elements WHERE urn = ? AND ${k} IS NOT NULL AND ${k} != '' LIMIT 15`
-            )
-            .all(urn);
-        paramSamples[k] = stripEmpty(rows.map((r) => r[k]));
-    }
-
-    // area keys from props_flat (for "diện tích" questions)
-    const docs = db
-        .prepare("SELECT props_flat FROM elements WHERE urn = ? LIMIT 50")
-        .all(urn);
-    const areaKeySet = new Set();
-    for (const d of docs) {
-        if (!d.props_flat) continue;
-        const pf = JSON.parse(d.props_flat);
-        for (const k of Object.keys(pf)) {
-            if (/area/i.test(k)) areaKeySet.add(k);
-        }
-    }
-
-    return {
-        categoryField,
-        categories,
-        paramSamples,
-        areaKeys: Array.from(areaKeySet).slice(0, 200),
-    };
-}
-
-function buildCountQuery({
-    urn,
-    categoryField,
-    category,
-    filterParam,
-    filterValue,
-}) {
-    const q = { urn };
-    if (category) q[categoryField] = category;
-    if (
-        filterParam &&
-        filterValue !== undefined &&
-        filterValue !== null &&
-        String(filterValue).trim() !== ""
-    ) {
-        q[filterParam] = filterValue;
-    }
-    return q;
-}
-
-async function runQuery(db, meta, plan) {
-    const { urn } = plan;
-
-    // Normalize plan fields
-    const category = plan.category ? norm(plan.category) : null;
-    const limit = Number.isFinite(plan.limit) ? plan.limit : 20;
-
-    // NEW: Semantic search
-    let candidateIds = null;
-    if (plan.useSemanticSearch && plan.semanticQuery) {
-        try {
-            const queryEmbed = await generateEmbedding(plan.semanticQuery);
-            if (queryEmbed) {
-                candidateIds = semanticSearch(
-                    db,
-                    urn,
-                    queryEmbed,
-                    plan.topK || 100
-                );
-                console.log(
-                    `🔍 Semantic search found ${candidateIds.length} candidates`
-                );
-            }
-        } catch (error) {
-            console.error("⚠ Semantic search failed:", error.message);
-            // Continue with regular query
-        }
-    }
-
-    // Build WHERE clause
-    const whereClauses = ["urn = ?"];
-    const params = [urn];
-
-    if (candidateIds && candidateIds.length > 0) {
-        whereClauses.push(`id IN (${candidateIds.join(",")})`);
-    }
-
-    if (category) {
-        whereClauses.push(`${meta.categoryField} = ?`);
-        params.push(category);
-    }
-
-    if (
-        plan.filterParam &&
-        plan.filterValue !== undefined &&
-        plan.filterValue !== null &&
-        String(plan.filterValue).trim() !== ""
-    ) {
-        whereClauses.push(`${plan.filterParam} = ?`);
-        params.push(plan.filterValue);
-    }
-
-    const whereClause = whereClauses.join(" AND ");
-
-    if (plan.task === "count") {
-        console.log(
-            "🔍 Count query:",
-            `SELECT COUNT(*) as count FROM elements WHERE ${whereClause}`
-        );
-        const row = db
-            .prepare(
-                `SELECT COUNT(*) as count FROM elements WHERE ${whereClause}`
-            )
-            .get(...params);
-        return { kind: "count", count: row.count };
-    }
-
-    if (plan.task === "distinct") {
-        const field = plan.targetParam;
-        if (!field) throw new Error("distinct requires targetParam");
-
-        const rows = db
-            .prepare(
-                `SELECT DISTINCT ${field} FROM elements WHERE ${whereClause} AND ${field} IS NOT NULL LIMIT ?`
-            )
-            .all(...params, limit);
-
-        const values = rows.map((r) => norm(r[field])).filter(Boolean);
-        return { kind: "distinct", field, values };
-    }
-
-    if (plan.task === "group_count") {
-        const field = plan.targetParam;
-        if (!field) throw new Error("group_count requires targetParam");
-
-        const rows = db
-            .prepare(
-                `SELECT ${field}, COUNT(*) as count
-       FROM elements
-       WHERE ${whereClause} AND ${field} IS NOT NULL
-       GROUP BY ${field}
-       ORDER BY count DESC
-       LIMIT ?`
-            )
-            .all(...params, limit);
-
-        return { kind: "group_count", field, rows };
-    }
-
-    if (plan.task === "sum_area") {
-        // sum numeric area from props_flat dynamic key
-        const propsFlatKey = plan.propsFlatKey;
-        if (!propsFlatKey) throw new Error("sum_area requires propsFlatKey");
-
-        const rows = db
-            .prepare(
-                `SELECT json_extract(props_flat, ?) as area_raw FROM elements WHERE ${whereClause}`
-            )
-            .all(`$.${propsFlatKey}`, ...params);
-        console.log("📝 Rows:", rows);
-
-        let total_area = 0;
-        let n = 0;
-
-        for (const row of rows) {
-            if (!row.area_raw) continue;
-
-            let areaNum = 0;
-            if (typeof row.area_raw === "number") {
-                areaNum = row.area_raw;
-            } else if (typeof row.area_raw === "string") {
-                // Extract number from string (handle formats like "123.45 m²" or "123,45")
-                const match = String(row.area_raw).match(
-                    /[-+]?\d+(?:[.,]\d+)?/
-                );
-                if (match) {
-                    areaNum = parseFloat(match[0].replace(",", "."));
-                }
-            }
-
-            if (areaNum && !isNaN(areaNum)) {
-                total_area += areaNum;
-                n++;
-            }
-        }
-
-        return { kind: "sum_area", propsFlatKey, total_area, n };
-    }
-
-    // default: list docs
-    const rows = db
-        .prepare(
-            `SELECT urn, guid, dbId, name, component_type, type_name, family_name,
-            level_number, room_name, room_type,
-            system_type, system_name,
-            manufacturer, model_name,
-            omniclass_title, omniclass_number
-     FROM elements
-     WHERE ${whereClause}
-     LIMIT ?`
-        )
-        .all(...params, limit);
-
-    // Reconstruct nested structure for compatibility
-    const docs = rows.map((r) => ({
-        urn: r.urn,
-        guid: r.guid,
-        dbId: r.dbId,
-        name: r.name,
-        basic: {
-            component_type: r.component_type,
-            type_name: r.type_name,
-            family_name: r.family_name,
-        },
-        location: {
-            level_number: r.level_number,
-            room_name: r.room_name,
-            room_type: r.room_type,
-        },
-        system: {
-            system_type: r.system_type,
-            system_name: r.system_name,
-        },
-        equipment: {
-            manufacturer: r.manufacturer,
-            model_name: r.model_name,
-        },
-        omniclass: {
-            title: r.omniclass_title,
-            number: r.omniclass_number,
-        },
-    }));
-
-    return { kind: "list", docs };
-}
-
-// ----- Prompts (Planner -> Query -> Answer) -----
+// ============================================
+// SECTION 8: PROMPT BUILDERS
+// ============================================
 
 function intentPrompt({ question, categories, hintCategory }) {
     const cats = categories
@@ -397,7 +451,7 @@ ${JSON.stringify(plan1, null, 2)}
 
 Now choose detailed query parameters and return JSON with:
 - useSemanticSearch: boolean (true if question describes concepts/characteristics rather than exact categories)
-- semanticQuery: string (Vietnamese keywords for semantic search, only if useSemanticSearch=true)
+- semanticQuery: string (in English word, only if useSemanticSearch=true)
 - topK: integer (number of semantic candidates, default 100, only if useSemanticSearch=true)
 - filterParam: null OR one of:
   "level_number", "room_name", "room_type",
@@ -443,7 +497,7 @@ You are the ANSWER agent (Step 3: ANSWER). Use the query result to answer in Vie
 - If task is count: state the count and the category.
 - If task is distinct: list values (up to 10) and mention if more exist.
 - If task is group_count: show top groups with counts.
-- If task is sum_area: provide total and unit note (area unit depends on model; usually m²).
+- If task is sum_area: provide total area with unit (result.unit or default m²), count of elements (result.n), and any additional notes (result.notes).
 
 Context:
 categoryField used in DB: ${meta.categoryField}
@@ -468,44 +522,75 @@ Câu hỏi: ${JSON.stringify(question)}
 `.trim();
 }
 
-// ----- Route -----
+// ============================================
+// SECTION 9: PLAN HELPERS
+// ============================================
+
+function buildQueryPlan(plan1, plan2, urn, category) {
+    return {
+        urn,
+        intent: "bim",
+        task: plan1.task || "count",
+        category,
+        limit: plan2.limit || plan1.limit || DEFAULT_LIMIT,
+        filterParam: plan2.filterParam || null,
+        filterValue: plan2.filterValue ?? null,
+        targetParam: plan2.targetParam || null,
+        propsFlatKey: plan2.propsFlatKey || null,
+        useSemanticSearch: plan2.useSemanticSearch || false,
+        semanticQuery: plan2.semanticQuery || null,
+        topK: plan2.topK || DEFAULT_TOP_K,
+        notes: plan1.notes || "",
+    };
+}
+
+function validatePlanParams(plan) {
+    if (plan.filterParam && !ALLOWED_PARAMS.has(plan.filterParam)) {
+        plan.filterParam = null;
+    }
+    if (plan.targetParam && !ALLOWED_PARAMS.has(plan.targetParam)) {
+        plan.targetParam = null;
+    }
+    return plan;
+}
+
+// ============================================
+// SECTION 10: ROUTE HANDLER
+// ============================================
 
 router.post("/", async (req, res, next) => {
     try {
         const { urn, question, debug } = req.body || {};
+
         if (!urn) return res.status(400).json({ error: "Missing urn" });
         if (!question)
             return res.status(400).json({ error: "Missing question" });
 
         const db = getDb();
-
         const meta = await getMeta(db, urn);
         console.log("📊 Meta:", {
             categoryField: meta.categoryField,
             categories: meta.categories.slice(0, 10),
         });
 
+        // Step 1: Detect hint category
         const hintCategory = await detectHintCategory(
             question,
             meta.categories
         );
         console.log("💡 Hint category:", hintCategory);
 
-        const plan1 = await geminiJson(
-            intentPrompt({
-                question,
-                categories: meta.categories,
-                hintCategory,
-            })
-        );
+        // Step 2: Get intent from LLM
         const plan1Prompt = intentPrompt({
             question,
             categories: meta.categories,
             hintCategory,
         });
+        const plan1 = await geminiJson(plan1Prompt);
         console.log("📝 Plan1Prompt:", plan1Prompt);
         console.log("📝 Plan1:", plan1);
 
+        // Handle general questions
         if (plan1.intent === "general") {
             const answer = await geminiText(generalPrompt(question), {
                 temperature: 0.2,
@@ -516,72 +601,38 @@ router.post("/", async (req, res, next) => {
             });
         }
 
-        // Fix category if LLM missed but we have a strong hint and category exists
+        // Fix category if LLM missed but we have a strong hint
         let category = plan1.category ? norm(plan1.category) : null;
-        if (!category && hintCategory && meta.categories.includes(hintCategory))
+        if (
+            !category &&
+            hintCategory &&
+            meta.categories.includes(hintCategory)
+        ) {
             category = hintCategory;
+        }
         console.log("🎯 Final category:", category);
 
-        // Step 2: choose parameters (including semantic search)
-        const plan2 = await geminiJson(
-            parameterPrompt({
-                question,
-                plan1: { ...plan1, category },
-                paramSamples: meta.paramSamples,
-                areaKeys: meta.areaKeys,
-            })
-        );
-        console.log("📝 Plan2:", plan2);
+        // Step 3: Get parameters from LLM
         const plan2Prompt = parameterPrompt({
             question,
             plan1: { ...plan1, category },
             paramSamples: meta.paramSamples,
             areaKeys: meta.areaKeys,
         });
+        const plan2 = await geminiJson(plan2Prompt);
         console.log("📝 Plan2Prompt:", plan2Prompt);
+        console.log("📝 Plan2:", plan2);
 
-        // Merge plan
-        const plan = {
-            urn,
-            intent: "bim",
-            task: plan1.task || "count",
-            category,
-            limit: plan2.limit || plan1.limit || 20,
-            filterParam: plan2.filterParam || null,
-            filterValue: plan2.filterValue ?? null,
-            targetParam: plan2.targetParam || null,
-            propsFlatKey: plan2.propsFlatKey || null,
-            useSemanticSearch: plan2.useSemanticSearch || false,
-            semanticQuery: plan2.semanticQuery || null,
-            topK: plan2.topK || 100,
-            notes: plan1.notes || "",
-        };
-
-        // Normalize known params (remove nested paths for SQLite)
-        const allowedParams = new Set([
-            "level_number",
-            "room_name",
-            "room_type",
-            "system_name",
-            "system_type",
-            "manufacturer",
-            "model_name",
-            "type_name",
-            "family_name",
-            "omniclass_title",
-        ]);
-        if (plan.filterParam && !allowedParams.has(plan.filterParam))
-            plan.filterParam = null;
-        if (plan.targetParam && !allowedParams.has(plan.targetParam))
-            plan.targetParam = null;
-
+        // Step 4: Build and validate plan
+        let plan = buildQueryPlan(plan1, plan2, urn, category);
+        plan = validatePlanParams(plan);
         console.log("🔍 Final plan:", plan);
 
-        // Query
-        const result = await runQuery(db, meta, plan);
+        // Step 5: Execute query
+        const result = await runQuery(db, meta, plan, question);
         console.log("✅ Query result:", result);
 
-        // Answer
+        // Step 6: Generate answer
         const answer = await geminiText(
             answerPrompt({ question, meta, plan, result }),
             { temperature: 0.2 }
