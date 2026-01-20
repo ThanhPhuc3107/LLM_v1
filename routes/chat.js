@@ -39,7 +39,7 @@ const SAMPLE_KEYS = [
     "family_name",
 ];
 
-const DEFAULT_LIMIT = 20;
+const DEFAULT_LIMIT = 999;
 const DEFAULT_TOP_K = 100;
 
 // ============================================
