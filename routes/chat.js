@@ -5,9 +5,8 @@
 const express = require("express");
 const router = express.Router();
 
-const { getDb, semanticSearch } = require("../services/sqlite");
+const { getDb } = require("../services/sqlite");
 const { geminiJson, geminiText } = require("../services/gemini");
-const { generateEmbedding } = require("../services/embeddings");
 
 // ============================================
 // SECTION 2: CONSTANTS
@@ -39,9 +38,6 @@ const SAMPLE_KEYS = [
     "family_name",
 ];
 
-const DEFAULT_LIMIT = 999;
-const DEFAULT_TOP_K = 100;
-
 // ============================================
 // SECTION 3: STRING UTILITIES
 // ============================================
@@ -71,14 +67,14 @@ async function getMeta(db, urn) {
     for (const k of SAMPLE_KEYS) {
         const rows = db
             .prepare(
-                `SELECT DISTINCT ${k} FROM elements WHERE urn = ? AND ${k} IS NOT NULL AND ${k} != '' LIMIT 15`
+                `SELECT DISTINCT ${k} FROM elements WHERE urn = ? AND ${k} IS NOT NULL AND ${k} != ''`
             )
             .all(urn);
         paramSamples[k] = stripEmpty(rows.map((r) => r[k]));
     }
 
     const docs = db
-        .prepare("SELECT props_flat FROM elements WHERE urn = ? LIMIT 50")
+        .prepare("SELECT props_flat FROM elements WHERE urn = ?")
         .all(urn);
     const areaKeySet = new Set();
     for (const d of docs) {
@@ -93,7 +89,7 @@ async function getMeta(db, urn) {
         categoryField,
         categories,
         paramSamples,
-        areaKeys: Array.from(areaKeySet).slice(0, 200),
+        areaKeys: Array.from(areaKeySet),
     };
 }
 
@@ -112,20 +108,20 @@ function handleCountTask(db, whereClause, params) {
     return { kind: "count", count: row.count };
 }
 
-function handleDistinctTask(db, whereClause, params, field, limit) {
+function handleDistinctTask(db, whereClause, params, field) {
     if (!field) throw new Error("distinct requires targetParam");
 
     const rows = db
         .prepare(
-            `SELECT DISTINCT ${field} FROM elements WHERE ${whereClause} AND ${field} IS NOT NULL LIMIT ?`
+            `SELECT DISTINCT ${field} FROM elements WHERE ${whereClause} AND ${field} IS NOT NULL`
         )
-        .all(...params, limit);
+        .all(...params);
 
     const values = rows.map((r) => norm(r[field])).filter(Boolean);
     return { kind: "distinct", field, values };
 }
 
-function handleGroupCountTask(db, whereClause, params, field, limit) {
+function handleGroupCountTask(db, whereClause, params, field) {
     if (!field) throw new Error("group_count requires targetParam");
 
     const rows = db
@@ -134,10 +130,9 @@ function handleGroupCountTask(db, whereClause, params, field, limit) {
              FROM elements
              WHERE ${whereClause} AND ${field} IS NOT NULL
              GROUP BY ${field}
-             ORDER BY count DESC
-             LIMIT ?`
+             ORDER BY count DESC`
         )
-        .all(...params, limit);
+        .all(...params);
 
     return { kind: "group_count", field, rows };
 }
@@ -151,47 +146,41 @@ async function handleSumAreaTask(db, whereClause, params, plan, question) {
             `SELECT json_extract(props_flat, ?) as area_raw, name, type_name, level_number FROM elements WHERE ${whereClause}`
         )
         .all(`$."${propsFlatKey}"`, ...params);
-    console.log("📝 Rows:", rows);
+    console.log(`SELECT json_extract(props_flat, ?) as area_raw, name, type_name, level_number FROM elements WHERE ${whereClause}`);
+    console.log(`$."${propsFlatKey}"`, ...params);
+    console.log("📝 Area rows count:", rows.length);
+    console.log("📝 Area rows:", rows);
 
-    const areaAnalysisPrompt = `You are a BIM data analyst. Extract and calculate the total area from the provided data based on the user's question and query context.
+    const areaAnalysisPrompt = `You are a BIM data analyst. Extract and calculate the total area from the provided data.
 
 User question: ${question || plan?.notes}
 
-Query context (what data should be included):
+Query context:
 - Category filter: ${plan.category || "All components"}
-- Property key being analyzed: ${propsFlatKey}
-- Additional filter: ${
-        plan.filterParam ? `${plan.filterParam} = ${plan.filterValue}` : "None"
-    }
+- Property key: ${propsFlatKey}
+- Filter: ${plan.filterParam ? `${plan.filterParam} = ${plan.filterValue}` : "None"}
 
-Available data rows (already pre-filtered by SQL, showing area_raw, name, type_name, level_number):
-${JSON.stringify(rows.slice(0, 100), null, 2)}
+Data rows (area_raw, name, type_name, level_number):
+${JSON.stringify(rows.slice(0, 200), null, 2)}
 
 Instructions:
-1. Review the user's question
-2. The rows provided are ALREADY filtered by SQL based on the user's question
-3. Parse EACH area_raw value from the provided rows:
-   - Handle numbers: 123.45
-   - Handle strings with units: "123.45 m²", "123.45m2"
-   - Handle comma decimals: "123,45"
-   - Extract only the numeric part and convert to float
-4. Pick suitable area_raw value from the provided rows based on the user's question
-5. Calcuate and return JSON with:
-   {
-     "total_area": number (sum of all valid areas),
-     "count": number (count of rows with valid area values),
-     "unit": "m²" or detected unit from the data,
-     "notes": "brief explanation in Vietnamese - what was calculated, which components/floors/filters were included"
-   }
-
-CRITICAL:
-- Include ALL rows provided (they are already filtered by the SQL query)
-- In notes, explain what was calculated (e.g., "Tổng diện tích căn nhà" or "Diện tích sàn tầng 2")`;
+1. Parse EACH area_raw value:
+   - Numbers: 123.45
+   - Strings with units: "123.45 m²", "123.45m2"
+   - Comma decimals: "123,45"
+2. Sum all valid areas
+3. Return JSON:
+{
+  "total_area": number,
+  "count": number,
+  "unit": "m²",
+  "notes": "brief explanation in Vietnamese"
+}`;
 
     const areaResult = await geminiJson(areaAnalysisPrompt, {
         temperature: 0.1,
     });
-    console.log("🧮 Gemini area analysis:", areaResult);
+    console.log("🧮 Area analysis:", areaResult);
 
     return {
         kind: "sum_area",
@@ -203,7 +192,7 @@ CRITICAL:
     };
 }
 
-function handleListTask(db, whereClause, params, limit) {
+function handleListTask(db, whereClause, params) {
     const rows = db
         .prepare(
             `SELECT urn, guid, dbId, name, component_type, type_name, family_name,
@@ -212,10 +201,9 @@ function handleListTask(db, whereClause, params, limit) {
                     manufacturer, model_name,
                     omniclass_title, omniclass_number
              FROM elements
-             WHERE ${whereClause}
-             LIMIT ?`
+             WHERE ${whereClause}`
         )
-        .all(...params, limit);
+        .all(...params);
 
     const docs = rows.map((r) => ({
         urn: r.urn,
@@ -256,36 +244,10 @@ function handleListTask(db, whereClause, params, limit) {
 async function runQuery(db, meta, plan, question) {
     const { urn } = plan;
     const category = plan.category ? norm(plan.category) : null;
-    const limit = Number.isFinite(plan.limit) ? plan.limit : DEFAULT_LIMIT;
-
-    // Semantic search for candidate IDs
-    let candidateIds = null;
-    if (plan.useSemanticSearch && plan.semanticQuery) {
-        try {
-            const queryEmbed = await generateEmbedding(plan.semanticQuery);
-            if (queryEmbed) {
-                candidateIds = semanticSearch(
-                    db,
-                    urn,
-                    queryEmbed,
-                    plan.topK || DEFAULT_TOP_K
-                );
-                console.log(
-                    `🔍 Semantic search found ${candidateIds.length} candidates`
-                );
-            }
-        } catch (error) {
-            console.error("⚠ Semantic search failed:", error.message);
-        }
-    }
 
     // Build WHERE clause
     const whereClauses = ["urn = ?"];
     const params = [urn];
-
-    if (candidateIds && candidateIds.length > 0) {
-        whereClauses.push(`id IN (${candidateIds.join(",")})`);
-    }
 
     if (category) {
         whereClauses.push(`${meta.categoryField} = ?`);
@@ -309,199 +271,117 @@ async function runQuery(db, meta, plan, question) {
         case "count":
             return handleCountTask(db, whereClause, params);
         case "distinct":
-            return handleDistinctTask(
-                db,
-                whereClause,
-                params,
-                plan.targetParam,
-                limit
-            );
+            return handleDistinctTask(db, whereClause, params, plan.targetParam);
         case "group_count":
-            return handleGroupCountTask(
-                db,
-                whereClause,
-                params,
-                plan.targetParam,
-                limit
-            );
+            return handleGroupCountTask(db, whereClause, params, plan.targetParam);
         case "sum_area":
             return handleSumAreaTask(db, whereClause, params, plan, question);
         default:
-            return handleListTask(db, whereClause, params, limit);
+            return handleListTask(db, whereClause, params);
     }
 }
 
 // ============================================
-// SECTION 7: LLM INTEGRATION
+// SECTION 7: UNIFIED QUESTION ANALYSIS (SINGLE LLM CALL)
 // ============================================
 
-async function detectHintCategory(question, availableCategories) {
-    if (!question || !availableCategories || availableCategories.length === 0) {
-        return null;
-    }
-
-    console.log("💡 Available categories:", availableCategories);
-
-    try {
-        const prompt = `Bạn là chuyên gia BIM. Dựa vào câu hỏi của người dùng, hãy xác định loại thành phần BIM (component_type) phù hợp nhất.
-
-Câu hỏi: "${question}"
-
-Các loại thành phần có sẵn (chọn 1 hoặc null):
-${availableCategories.map((c) => `- ${c}`).join("\n")}
-
-Trả về JSON với format:
-{
-  "category": "tên chính xác từ danh sách trên hoặc null",
-  "confidence": "high|medium|low",
-  "reason": "lý do ngắn gọn"
-}
-
-Lưu ý:
-- "cửa" (trừ "cửa sổ") → Doors
-- "cửa sổ" → Windows
-- "tường" → Walls
-- "sàn" → Floors
-- "cột" → Columns
-- "dầm" → Beams
-- "ống" → Pipes hoặc Ducts
-- IMPORTANT: For area queries ("diện tích tòa nhà", "tổng diện tích", "diện tích sàn", etc.) → Floors (if available)
-- Chỉ trả về category nếu confidence >= medium
-- Trả về null nếu không chắc chắn`;
-        console.log("💡 Prompt:", prompt);
-
-        const result = await geminiJson(prompt, { temperature: 0.1 });
-
-        if (result.category && result.confidence !== "low") {
-            console.log(
-                `💡 LLM hint: ${result.category} (${result.confidence}) - ${result.reason}`
-            );
-            return result.category;
-        }
-    } catch (error) {
-        console.error("⚠ LLM hint detection failed:", error.message);
-    }
-
-    return null;
-}
-
-// ============================================
-// SECTION 8: PROMPT BUILDERS
-// ============================================
-
-function intentPrompt({ question, categories, hintCategory }) {
-    const cats = categories
-        .slice(0, 120)
-        .map((c) => `- ${c}`)
+function buildAnalysisPrompt({ question, categories, paramSamples, areaKeys }) {
+    const numberedCats = categories
+        .map((c, i) => `${i + 1}. "${c}"`)
         .join("\n");
 
-    return `
-You are the PLANNER in a 3-step pipeline: Planner -> Query -> Answer.
-User question is in Vietnamese and is about a BIM model.
-
-Step 1 (INTENT): decide if the user wants BIM data from database, or a general explanation.
-Return JSON with:
-- intent: "bim" | "general"
-- task: "count" | "distinct" | "group_count" | "sum_area" | "list"
-- category: one of the provided categories OR null if not needed
-- limit: integer (default 20)
-- notes: short string
-
-Hints:
-- "cửa" usually means Doors; "cửa sổ" means Windows.
-- If user asks "bao nhiêu" => count.
-- If user asks "liệt kê các loại" => distinct (list unique types).
-- If user asks "theo tầng" => likely group_count by location.level_number.
-- If user asks "diện tích" => sum_area.
-- IMPORTANT: If asking about general area or building area ("diện tích tòa nhà", "tổng diện tích", etc.) => category should be "Floors" (if available).
-
-If you choose category, choose ONLY from the list.
-If you are unsure, choose null.
-
-Provided categories:
-${cats}
-
-Heuristic hintCategory (optional): ${hintCategory || "null"}
-
-User question: ${JSON.stringify(question)}
-`.trim();
-}
-
-function parameterPrompt({ question, plan1, paramSamples, areaKeys }) {
     const samplesText = Object.entries(paramSamples)
         .map(
             ([k, vals]) =>
-                `- ${k}: [${vals
-                    .slice(0, 8)
-                    .map((v) => JSON.stringify(v))
-                    .join(", ")}]`
+                `- ${k}: [${vals.slice(0, 10).map((v) => JSON.stringify(v)).join(", ")}]`
         )
         .join("\n");
 
-    const areaText = areaKeys
-        .slice(0, 40)
-        .map((k) => `- ${k}`)
-        .join("\n");
+    const areaText = areaKeys.slice(0, 30).map((k) => `- ${k}`).join("\n");
 
-    return `
-You are the PLANNER (Step 2: PARAMETERS) for BIM database query.
+    return `Bạn là chuyên gia phân tích BIM. Phân tích câu hỏi và trả về query plan.
 
-You already decided:
-${JSON.stringify(plan1, null, 2)}
+## DANH SÁCH CATEGORY (chọn CHÍNH XÁC từ danh sách, hoặc null):
+${numberedCats}
 
-Now choose detailed query parameters and return JSON with:
-- useSemanticSearch: boolean (true if question describes concepts/characteristics rather than exact categories)
-- semanticQuery: string (in English word, only if useSemanticSearch=true)
-- topK: integer (number of semantic candidates, default 100, only if useSemanticSearch=true)
-- filterParam: null OR one of:
-  "level_number", "room_name", "room_type",
-  "system_name", "system_type",
-  "manufacturer", "model_name",
-  "type_name", "family_name", "omniclass_title"
-- filterValue: null OR string (only if the question explicitly contains a value like a level name)
-- targetParam: for task "distinct" or "group_count": one of the same param list above
-- propsFlatKey: for task "sum_area": choose 1 key from areaKeys OR null if none fits
-- limit: integer
+## TASK TYPES:
+- "count": đếm số lượng (bao nhiêu, có mấy, số lượng)
+- "distinct": liệt kê giá trị duy nhất (liệt kê các loại, những loại nào)
+- "group_count": đếm theo nhóm (theo tầng, theo phòng, phân theo)
+- "sum_area": tính tổng diện tích (diện tích, tổng diện tích)
+- "list": liệt kê chi tiết (liệt kê, cho xem, danh sách)
 
-Semantic Search Guidelines:
-- Set useSemanticSearch=true when:
-  * Question asks for "structural components" (kết cấu), "electrical equipment" (thiết bị điện), etc.
-  * Question describes characteristics: "transparent" (trong suốt), "load-bearing" (chịu lực)
-  * Question uses general terms that might map to multiple categories
-- Set useSemanticSearch=false when:
-  * Question explicitly names a category like "Doors", "Windows", "Walls"
-  * Simple count/list queries with exact category match
+## VIETNAMESE → CATEGORY MAPPING:
+- "cửa" (không phải "cửa sổ") → Doors
+- "cửa sổ" → Windows
+- "tường", "vách" → Walls
+- "sàn", "diện tích nhà/tòa nhà" → Floors
+- "mái" → Roofs
+- "cột", "trụ" → Columns
+- "dầm" → Beams
+- "cầu thang" → Stairs
+- "lan can" → Railings
 
-Rules:
-- For task "count": usually no targetParam; filterParam only if question says "ở tầng ..." or "phòng ...".
-- For task "distinct": choose targetParam = "type_name" (preferred) or "family_name".
-- For task "group_count": choose targetParam based on grouping requested (level/room/system...).
-- For task "sum_area": ALWAYS prioritize "Dimensions.Area" if available in areaKeys. Only choose other keys if "Dimensions.Area" is not present.
-
-paramSamples:
+## AVAILABLE FILTER PARAMETERS & VALUES:
 ${samplesText}
 
-areaKeys:
+## AREA KEYS (for sum_area):
 ${areaText}
 
-User question: ${JSON.stringify(question)}
-`.trim();
+## CÂU HỎI: "${question}"
+
+## RULES:
+1. intent: "bim" nếu hỏi về dữ liệu BIM, "general" nếu hỏi kiến thức chung
+2. category: PHẢI là tên CHÍNH XÁC từ danh sách trên, hoặc null
+3. filterParam/filterValue: chỉ set nếu câu hỏi đề cập cụ thể (vd: "tầng 1", "phòng khách")
+4. targetParam: cho "distinct" → "type_name"; cho "group_count" → field để group
+5. propsFlatKey: cho "sum_area" → ưu tiên "Dimensions.Area" nếu có
+
+Trả về JSON:
+{
+  "intent": "bim" | "general",
+  "task": "count" | "distinct" | "group_count" | "sum_area" | "list",
+  "category": "EXACT_NAME_OR_NULL",
+  "filterParam": "PARAM_OR_NULL",
+  "filterValue": "VALUE_OR_NULL",
+  "targetParam": "PARAM_OR_NULL",
+  "propsFlatKey": "KEY_OR_NULL",
+  "notes": "brief reason"
+}`.trim();
 }
 
+async function analyzeQuestion(question, meta) {
+    const prompt = buildAnalysisPrompt({
+        question,
+        categories: meta.categories,
+        paramSamples: meta.paramSamples,
+        areaKeys: meta.areaKeys,
+    });
+
+    console.log("📝 Analysis prompt:", prompt);
+    console.log("📝 Analysis prompt length:", prompt.length);
+
+    const result = await geminiJson(prompt, { temperature: 0.1 });
+    console.log("📝 Analysis result:", result);
+
+    return result;
+}
+
+// ============================================
+// SECTION 8: ANSWER PROMPT
+// ============================================
+
 function answerPrompt({ question, meta, plan, result }) {
-    return `
-You are the ANSWER agent (Step 3: ANSWER). Use the query result to answer in Vietnamese.
+    return `Trả lời câu hỏi bằng tiếng Việt dựa trên kết quả query.
 
-- Answer should be short, correct, and directly address the question.
-- If result is empty or category not found, explain what is missing and suggest 2-3 alternative queries user can try.
-- If task is count: state the count and the category.
-- If task is distinct: list values (up to 10) and mention if more exist.
-- If task is group_count: show top groups with counts.
-- If task is sum_area: provide total area with unit (result.unit or default m²), count of elements (result.n), and any additional notes (result.notes).
+- Trả lời ngắn gọn, chính xác
+- Nếu không có kết quả, giải thích và gợi ý 2-3 câu hỏi thay thế
+- Nếu task là count: nêu số lượng và loại
+- Nếu task là distinct: liệt kê các giá trị
+- Nếu task là group_count: hiển thị các nhóm với số lượng
+- Nếu task là sum_area: cung cấp tổng diện tích với đơn vị và ghi chú
 
-Context:
-categoryField used in DB: ${meta.categoryField}
-Available categories example: ${meta.categories.slice(0, 15).join(", ")}
+Available categories: ${meta.categories.slice(0, 15).join(", ")}
 
 Plan:
 ${JSON.stringify(plan, null, 2)}
@@ -509,49 +389,64 @@ ${JSON.stringify(plan, null, 2)}
 Result:
 ${JSON.stringify(result, null, 2)}
 
-User question: ${JSON.stringify(question)}
-`.trim();
+Câu hỏi: "${question}"`.trim();
 }
 
 function generalPrompt(question) {
-    return `
-Bạn là trợ lý kỹ thuật BIM/APS. Hãy trả lời câu hỏi sau ngắn gọn, chính xác, bằng tiếng Việt.
-Nếu cần, đưa ví dụ lệnh curl/PowerShell hoặc hướng dẫn kiểm tra nhanh.
+    return `Bạn là trợ lý kỹ thuật BIM/APS. Trả lời ngắn gọn, chính xác, bằng tiếng Việt.
 
-Câu hỏi: ${JSON.stringify(question)}
-`.trim();
+Câu hỏi: "${question}"`.trim();
 }
 
 // ============================================
 // SECTION 9: PLAN HELPERS
 // ============================================
 
-function buildQueryPlan(plan1, plan2, urn, category) {
+function validateAndBuildPlan(analysis, urn, availableCategories) {
+    // Validate category
+    let category = null;
+    if (analysis.category) {
+        const normalizedCategory = norm(analysis.category);
+        const exactMatch = availableCategories.find((c) => c === normalizedCategory);
+        if (exactMatch) {
+            category = exactMatch;
+        } else {
+            const caseMatch = availableCategories.find(
+                (c) => c.toLowerCase() === normalizedCategory.toLowerCase()
+            );
+            if (caseMatch) {
+                category = caseMatch;
+                console.log(`⚠ Category case fix: "${analysis.category}" → "${category}"`);
+            } else {
+                console.log(`⚠ Invalid category: "${analysis.category}" - ignoring`);
+            }
+        }
+    }
+
+    // Validate params
+    let filterParam = analysis.filterParam || null;
+    let targetParam = analysis.targetParam || null;
+
+    if (filterParam && !ALLOWED_PARAMS.has(filterParam)) {
+        console.log(`⚠ Invalid filterParam: "${filterParam}" - ignoring`);
+        filterParam = null;
+    }
+    if (targetParam && !ALLOWED_PARAMS.has(targetParam)) {
+        console.log(`⚠ Invalid targetParam: "${targetParam}" - ignoring`);
+        targetParam = null;
+    }
+
     return {
         urn,
-        intent: "bim",
-        task: plan1.task || "count",
+        intent: analysis.intent || "bim",
+        task: analysis.task || "count",
         category,
-        limit: plan2.limit || plan1.limit || DEFAULT_LIMIT,
-        filterParam: plan2.filterParam || null,
-        filterValue: plan2.filterValue ?? null,
-        targetParam: plan2.targetParam || null,
-        propsFlatKey: plan2.propsFlatKey || null,
-        useSemanticSearch: plan2.useSemanticSearch || false,
-        semanticQuery: plan2.semanticQuery || null,
-        topK: plan2.topK || DEFAULT_TOP_K,
-        notes: plan1.notes || "",
+        filterParam,
+        filterValue: analysis.filterValue ?? null,
+        targetParam,
+        propsFlatKey: analysis.propsFlatKey || null,
+        notes: analysis.notes || "",
     };
-}
-
-function validatePlanParams(plan) {
-    if (plan.filterParam && !ALLOWED_PARAMS.has(plan.filterParam)) {
-        plan.filterParam = null;
-    }
-    if (plan.targetParam && !ALLOWED_PARAMS.has(plan.targetParam)) {
-        plan.targetParam = null;
-    }
-    return plan;
 }
 
 // ============================================
@@ -563,76 +458,40 @@ router.post("/", async (req, res, next) => {
         const { urn, question, debug } = req.body || {};
 
         if (!urn) return res.status(400).json({ error: "Missing urn" });
-        if (!question)
-            return res.status(400).json({ error: "Missing question" });
+        if (!question) return res.status(400).json({ error: "Missing question" });
 
         const db = getDb();
         const meta = await getMeta(db, urn);
         console.log("📊 Meta:", {
             categoryField: meta.categoryField,
+            categoriesCount: meta.categories.length,
             categories: meta.categories.slice(0, 10),
         });
 
-        // Step 1: Detect hint category
-        const hintCategory = await detectHintCategory(
-            question,
-            meta.categories
-        );
-        console.log("💡 Hint category:", hintCategory);
-
-        // Step 2: Get intent from LLM
-        const plan1Prompt = intentPrompt({
-            question,
-            categories: meta.categories,
-            hintCategory,
-        });
-        const plan1 = await geminiJson(plan1Prompt);
-        console.log("📝 Plan1Prompt:", plan1Prompt);
-        console.log("📝 Plan1:", plan1);
+        // Step 1: Analyze question (SINGLE LLM CALL for intent + category + params)
+        const analysis = await analyzeQuestion(question, meta);
 
         // Handle general questions
-        if (plan1.intent === "general") {
+        if (analysis.intent === "general") {
             const answer = await geminiText(generalPrompt(question), {
                 temperature: 0.2,
             });
             return res.json({
                 answer,
-                ...(debug ? { debug: { meta, plan1 } } : {}),
+                ...(debug ? { debug: { meta, analysis } } : {}),
             });
         }
 
-        // Fix category if LLM missed but we have a strong hint
-        let category = plan1.category ? norm(plan1.category) : null;
-        if (
-            !category &&
-            hintCategory &&
-            meta.categories.includes(hintCategory)
-        ) {
-            category = hintCategory;
-        }
-        console.log("🎯 Final category:", category);
-
-        // Step 3: Get parameters from LLM
-        const plan2Prompt = parameterPrompt({
-            question,
-            plan1: { ...plan1, category },
-            paramSamples: meta.paramSamples,
-            areaKeys: meta.areaKeys,
-        });
-        const plan2 = await geminiJson(plan2Prompt);
-        console.log("📝 Plan2Prompt:", plan2Prompt);
-        console.log("📝 Plan2:", plan2);
-
-        // Step 4: Build and validate plan
-        let plan = buildQueryPlan(plan1, plan2, urn, category);
-        plan = validatePlanParams(plan);
+        // Step 2: Build and validate plan
+        const plan = validateAndBuildPlan(analysis, urn, meta.categories);
         console.log("🔍 Final plan:", plan);
 
-        // Step 5: Execute query
+        // Step 3: Execute query
         const result = await runQuery(db, meta, plan, question);
         console.log("✅ Query result:", result);
 
-        // Step 6: Generate answer
+        console.log("📝 Answer prompt:", answerPrompt({ question, meta, plan, result }));
+        // Step 4: Generate answer
         const answer = await geminiText(
             answerPrompt({ question, meta, plan, result }),
             { temperature: 0.2 }
