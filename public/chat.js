@@ -106,8 +106,15 @@ export function initChat() {
     function addBotMessage(text) {
         const messageDiv = document.createElement('div');
         messageDiv.className = 'chat-message bot';
+
+        // Parse markdown to HTML using marked library
+        const markdownHtml = marked.parse(text, {
+            breaks: true,  // Convert line breaks to <br>
+            gfm: true      // Enable GitHub Flavored Markdown
+        });
+
         messageDiv.innerHTML = `
-            <div class="message-content">${escapeHtml(text)}</div>
+            <div class="message-content markdown-content">${markdownHtml}</div>
         `;
         chatMessages.appendChild(messageDiv);
         scrollToBottom();
