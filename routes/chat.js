@@ -77,11 +77,13 @@ async function getMeta(db, urn) {
         .prepare("SELECT props_flat FROM elements WHERE urn = ?")
         .all(urn);
     const areaKeySet = new Set();
+    const volumeKeySet = new Set();
     for (const d of docs) {
         if (!d.props_flat) continue;
         const pf = JSON.parse(d.props_flat);
         for (const k of Object.keys(pf)) {
             if (/area/i.test(k)) areaKeySet.add(k);
+            if (/volume/i.test(k)) volumeKeySet.add(k);
         }
     }
 
@@ -90,6 +92,7 @@ async function getMeta(db, urn) {
         categories,
         paramSamples,
         areaKeys: Array.from(areaKeySet),
+        volumeKeys: Array.from(volumeKeySet),
     };
 }
 
@@ -192,6 +195,60 @@ Instructions:
     };
 }
 
+async function handleSumVolumeTask(db, whereClause, params, plan, question) {
+    const propsFlatKey = plan.propsFlatKey || "Dimensions.Volume";
+
+    const rows = db
+        .prepare(
+            `SELECT json_extract(props_flat, ?) as volume_raw, name, type_name, level_number FROM elements WHERE ${whereClause}`
+        )
+        .all(`$."${propsFlatKey}"`, ...params);
+    console.log(`SELECT json_extract(props_flat, ?) as volume_raw, name, type_name, level_number FROM elements WHERE ${whereClause}`);
+    console.log(`$."${propsFlatKey}"`, ...params);
+    console.log("📝 Volume rows count:", rows.length);
+    console.log("📝 Volume rows:", rows);
+
+    const volumeAnalysisPrompt = `You are a BIM data analyst. Extract and calculate the total volume from the provided data.
+
+User question: ${question || plan?.notes}
+
+Query context:
+- Category filter: ${plan.category || "All components"}
+- Property key: ${propsFlatKey}
+- Filter: ${plan.filterParam ? `${plan.filterParam} = ${plan.filterValue}` : "None"}
+
+Data rows (volume_raw, name, type_name, level_number):
+${JSON.stringify(rows.slice(0, 200), null, 2)}
+
+Instructions:
+1. Parse EACH volume_raw value:
+   - Numbers: 123.45
+   - Strings with units: "123.45 m³", "123.45m3"
+   - Comma decimals: "123,45"
+2. Sum all valid volumes
+3. Return JSON:
+{
+  "total_volume": number,
+  "count": number,
+  "unit": "m³",
+  "notes": "brief explanation in Vietnamese"
+}`;
+
+    const volumeResult = await geminiJson(volumeAnalysisPrompt, {
+        temperature: 0.1,
+    });
+    console.log("🧮 Volume analysis:", volumeResult);
+
+    return {
+        kind: "sum_volume",
+        propsFlatKey,
+        total_volume: volumeResult.total_volume || 0,
+        n: volumeResult.count || 0,
+        unit: volumeResult.unit || "m³",
+        notes: volumeResult.notes || "",
+    };
+}
+
 function handleListTask(db, whereClause, params) {
     const rows = db
         .prepare(
@@ -276,6 +333,8 @@ async function runQuery(db, meta, plan, question) {
             return handleGroupCountTask(db, whereClause, params, plan.targetParam);
         case "sum_area":
             return handleSumAreaTask(db, whereClause, params, plan, question);
+        case "sum_volume":
+            return handleSumVolumeTask(db, whereClause, params, plan, question);
         default:
             return handleListTask(db, whereClause, params);
     }
@@ -285,7 +344,7 @@ async function runQuery(db, meta, plan, question) {
 // SECTION 7: UNIFIED QUESTION ANALYSIS (SINGLE LLM CALL)
 // ============================================
 
-function buildAnalysisPrompt({ question, categories, paramSamples, areaKeys }) {
+function buildAnalysisPrompt({ question, categories, paramSamples, areaKeys, volumeKeys }) {
     const numberedCats = categories
         .map((c, i) => `${i + 1}. "${c}"`)
         .join("\n");
@@ -298,6 +357,7 @@ function buildAnalysisPrompt({ question, categories, paramSamples, areaKeys }) {
         .join("\n");
 
     const areaText = areaKeys.slice(0, 30).map((k) => `- ${k}`).join("\n");
+    const volumeText = volumeKeys.slice(0, 30).map((k) => `- ${k}`).join("\n");
 
     return `Bạn là chuyên gia phân tích BIM. Phân tích câu hỏi và trả về query plan.
 
@@ -309,6 +369,7 @@ ${numberedCats}
 - "distinct": liệt kê giá trị duy nhất (liệt kê các loại, những loại nào)
 - "group_count": đếm theo nhóm (theo tầng, theo phòng, phân theo)
 - "sum_area": tính tổng diện tích (diện tích, tổng diện tích)
+- "sum_volume": tính tổng thể tích (thể tích, tổng thể tích, khối lượng, dung tích, volume)
 - "list": liệt kê chi tiết (liệt kê, cho xem, danh sách)
 
 ## VIETNAMESE → CATEGORY MAPPING:
@@ -328,6 +389,9 @@ ${samplesText}
 ## AREA KEYS (for sum_area):
 ${areaText}
 
+## VOLUME KEYS (for sum_volume):
+${volumeText}
+
 ## CÂU HỎI: "${question}"
 
 ## RULES:
@@ -335,12 +399,12 @@ ${areaText}
 2. category: PHẢI là tên CHÍNH XÁC từ danh sách trên, hoặc null
 3. filterParam/filterValue: chỉ set nếu câu hỏi đề cập cụ thể (vd: "tầng 1", "phòng khách")
 4. targetParam: cho "distinct" → "type_name"; cho "group_count" → field để group
-5. propsFlatKey: cho "sum_area" → ưu tiên "Dimensions.Area" nếu có
+5. propsFlatKey: cho "sum_area" → ưu tiên "Dimensions.Area" nếu có; cho "sum_volume" → ưu tiên "Dimensions.Volume" nếu có
 
 Trả về JSON:
 {
   "intent": "bim" | "general",
-  "task": "count" | "distinct" | "group_count" | "sum_area" | "list",
+  "task": "count" | "distinct" | "group_count" | "sum_area" | "sum_volume" | "list",
   "category": "EXACT_NAME_OR_NULL",
   "filterParam": "PARAM_OR_NULL",
   "filterValue": "VALUE_OR_NULL",
@@ -356,6 +420,7 @@ async function analyzeQuestion(question, meta) {
         categories: meta.categories,
         paramSamples: meta.paramSamples,
         areaKeys: meta.areaKeys,
+        volumeKeys: meta.volumeKeys,
     });
 
     console.log("📝 Analysis prompt:", prompt);
@@ -380,6 +445,7 @@ function answerPrompt({ question, meta, plan, result }) {
 - Nếu task là distinct: liệt kê các giá trị
 - Nếu task là group_count: hiển thị các nhóm với số lượng
 - Nếu task là sum_area: cung cấp tổng diện tích với đơn vị và ghi chú
+- Nếu task là sum_volume: cung cấp tổng thể tích với đơn vị và ghi chú
 
 Available categories: ${meta.categories.slice(0, 15).join(", ")}
 

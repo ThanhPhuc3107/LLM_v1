@@ -82,13 +82,28 @@ async function geminiJson(prompt, opts = {}) {
  */
 async function openaiText(prompt, opts = {}) {
     const client = getOpenAIClient();
-    const response = await client.chat.completions.create({
+
+    const payload = {
         model: opts.model || config.OPENAI_CHAT_MODEL || "gpt-4o-mini",
         messages: [{ role: "user", content: prompt }],
-        temperature: opts.temperature ?? 0.2,
-        top_p: opts.topP ?? 0.95,
-        max_tokens: opts.maxOutputTokens ?? 2048,
+        // max_completion_tokens: opts.maxOutputTokens ?? 2048,
+    };
+    if (payload.model.includes("gpt-5")) {
+        payload.max_completion_tokens = opts.maxOutputTokens ?? 2048;
+        payload.reasoning_effort = "medium";
+    } else {
+        payload.max_tokens = opts.maxOutputTokens ?? 2048;
+        payload.temperature = opts.temperature ?? 0.2;
+        payload.top_p = opts.topP ?? 0.95;
+    }
+
+    const response = await client.chat.completions.create({
+        ...payload,
     });
+    console.log(
+        "OpenAI model",
+        opts.model || config.OPENAI_CHAT_MODEL || "gpt-4o-mini"
+    );
     return response.choices[0].message.content;
 }
 
@@ -111,6 +126,10 @@ async function openaiJson(prompt, opts = {}) {
             lastErr = err;
         }
     }
+    console.log(
+        "OpenAI model",
+        opts.model || config.OPENAI_CHAT_MODEL || "gpt-4o-mini"
+    );
 
     throw lastErr;
 }
